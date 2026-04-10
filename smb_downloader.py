@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SMB-Downloader v3 — копирование файлов с сетевых дисков (SMB)
+SMB-Downloader v3.1 — копирование файлов с сетевых дисков (SMB)
 ===============================================================
-Исправления v3:
+v3.1 — новые возможности:
+  [NEW] Кнопка расчёта MD5 источника до начала копирования
+  [NEW] Раздельные записи в истории: MD5 рассчитан / копирование
+  [NEW] Двойной клик по истории — открыть папку с файлом
+  [NEW] Контекстное меню истории (повтор, открыть папку)
+  [NEW] Кнопка «Отмена» очищает поля ввода
+
+  Исправления v3:
   [FIX] Пауза/возобновление — корректное переоткрытие файлов
   [FIX] MD5 проверяется ТОЛЬКО при полном завершении (не при паузе/отмене)
   [NEW] Запись в историю при СТАРТЕ (статус «в процессе»)
@@ -27,6 +34,7 @@ import time
 import shutil
 import hashlib
 import logging
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from threading import Thread, Event
@@ -67,7 +75,20 @@ STATUS_PAUSED = "пауза"
 # ===================================================================
 # Логирование
 # ===================================================================
-PROGRAM_DIR = Path(__file__).resolve().parent
+# Определяем директорию программы.
+# При запуске из .exe (PyInstaller) __file__ указывает на временную директорию,
+# поэтому используем sys.executable для определения реальной папки.
+def _get_program_dir() -> Path:
+    """Возвращает дирекрию программы (работает и для .py, и для .exe)."""
+    if getattr(sys, 'frozen', False):
+        # Запуск из .exe (PyInstaller) — берём папку исполняемого файла
+        return Path(sys.executable).parent
+    else:
+        # Запуск из исходников
+        return Path(__file__).resolve().parent
+
+
+PROGRAM_DIR = _get_program_dir()
 LOG_FILE = PROGRAM_DIR / "copy_log.txt"
 
 
@@ -169,10 +190,11 @@ class HistoryManager:
             self.save()
 
     def find_in_progress(self, src: str, dst: str) -> int | None:
-        """Найти запись «в процессе» с такими же src/dst."""
+        """Найти запись «в процессе» или «MD5 рассчитан» с такими же src/dst."""
         for i, e in enumerate(self.entries):
             if (e.get("src") == src and e.get("dst") == dst and
-                    e.get("status") == STATUS_IN_PROGRESS):
+                    e.get("status") in (STATUS_IN_PROGRESS, "MD5 рассчитан",
+                                        STATUS_PAUSED)):
                 return i
         return None
 
@@ -184,7 +206,7 @@ class HistoryManager:
         if not self.entries:
             return
         keys = ["src", "dst", "size", "datetime", "status",
-                "avg_speed_kbps", "interruptions", "md5_match"]
+                "avg_speed_kbps", "interruptions", "md5_src", "md5_dst"]
         with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
             writer.writeheader()
@@ -686,7 +708,7 @@ class SMBDownloaderApp:
 
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("SMB-Downloader v3")
+        self.root.title("SMB-Downloader v3.1")
         self.config = load_config()
         self.root.geometry(self.config.get("window_geometry", "900x680"))
         self.root.minsize(700, 500)
@@ -705,6 +727,9 @@ class SMBDownloaderApp:
         self.chunk_sizer = DynamicChunkSizer(
             mode=self.config.get("chunk_mode", "auto"),
             manual_size=self.config.get("manual_chunk_size", CHUNK_SIZE_START))
+
+        # MD5 источника (рассчитывается заранее)
+        self._src_md5: str | None = None
 
         self._current_speed_kbps = 0.0
 
@@ -741,6 +766,9 @@ class SMBDownloaderApp:
         ttk.Entry(frm, textvariable=self.var_src).pack(
             side="left", fill="x", expand=True, padx=(0, PAD))
         ttk.Button(frm, text="Обзор…", command=self._choose_src).pack(side="right")
+        self.btn_md5_src = ttk.Button(frm, text="🔒 MD5", command=self._calc_src_md5,
+                                       state="disabled")
+        self.btn_md5_src.pack(side="right", padx=(0, 5))
 
         # Назначение
         frm = ttk.LabelFrame(self.tab_copy, text="Папка назначения", padding=PAD)
@@ -863,7 +891,7 @@ class SMBDownloaderApp:
         ttk.Button(f, text="🗑 Очистить",
                    command=self._history_clear).pack(side="left", padx=3)
 
-        cols = ("dt", "src", "dst", "sz", "st", "spd", "int", "md5")
+        cols = ("dt", "src", "dst", "sz", "st", "spd", "int", "md5_src", "md5_dst")
         self.hist_tree = ttk.Treeview(self.tab_history, columns=cols,
                                        show="headings", height=18)
         self.hist_tree.heading("dt", text="Дата/Время")
@@ -873,7 +901,8 @@ class SMBDownloaderApp:
         self.hist_tree.heading("st", text="Статус")
         self.hist_tree.heading("spd", text="Ср. скорость")
         self.hist_tree.heading("int", text="Обрывы")
-        self.hist_tree.heading("md5", text="MD5")
+        self.hist_tree.heading("md5_src", text="MD5 источника")
+        self.hist_tree.heading("md5_dst", text="MD5 приёмника")
 
         self.hist_tree.column("dt", width=130)
         self.hist_tree.column("src", width=160)
@@ -882,7 +911,8 @@ class SMBDownloaderApp:
         self.hist_tree.column("st", width=80)
         self.hist_tree.column("spd", width=90)
         self.hist_tree.column("int", width=50)
-        self.hist_tree.column("md5", width=200)
+        self.hist_tree.column("md5_src", width=180)
+        self.hist_tree.column("md5_dst", width=180)
 
         sb = ttk.Scrollbar(self.tab_history, orient="vertical",
                            command=self.hist_tree.yview)
@@ -891,13 +921,19 @@ class SMBDownloaderApp:
         sb.pack(side="right", fill="y")
 
         self.hist_tree.bind("<Double-Button-1>", self._history_double_click)
+        self.hist_tree.bind("<Button-3>", self._history_right_click)
+
+        # Контекстное меню
+        self.hist_menu = tk.Menu(self.root, tearoff=0)
+        self.hist_menu.add_command(label="Повторить копирование", command=self._history_menu_retry)
+        self.hist_menu.add_command(label="Открыть папку с файлом", command=self._history_menu_open_folder)
 
     # ======================== Выбор файлов ========================
 
     def _show_about(self):
         """Окно «О программе»."""
         about_text = (
-            "SMB-Downloader v3\n"
+            "SMB-Downloader v3.1\n"
             "═══════════════════\n\n"
             "Программа для надёжного копирования файлов\n"
             "с сетевых дисков (SMB, \\server\\share) на локальный компьютер.\n\n"
@@ -905,11 +941,14 @@ class SMBDownloaderApp:
             "  •  Возобновление копирования после обрыва связи или выключения ПК\n"
             "  •  Ограничение скорости (КБ/с) для слабых каналов\n"
             "  •  Прогресс-бар, ETA, отображение скорости\n"
+            "  •  Предварительный расчёт MD5 источника до копирования\n"
             "  •  Проверка целостности MD5 после завершения\n"
+            "  •  Раздельные записи в истории для MD5 и копирования\n"
             "  •  Автоматическая подстройка размера блока\n"
             "  •  Экспоненциальная задержка при потере сети\n"
             "  •  Автосохранение прогресса каждые 30 секунд\n"
-            "  •  История копирований с экспортом в CSV\n\n"
+            "  •  История копирований с экспортом в CSV\n"
+            "  •  Контекстное меню истории (повтор, открыть папку)\n\n"
             "═══════════════════\n"
             "Разработано Selebren\n"
             "в содружестве с Qwen Coder"
@@ -920,7 +959,62 @@ class SMBDownloaderApp:
         p = filedialog.askopenfilename(title="Выберите файл", initialdir=r"\\")
         if p:
             self.var_src.set(p)
+            self.btn_md5_src.config(state="normal")
+            self._src_md5 = None  # сброс при выборе нового файла
             logger.info(f"Source: {p}")
+
+    def _calc_src_md5(self):
+        """Рассчитать MD5 исходного файла и записать в историю."""
+        src = self.var_src.get().strip()
+        if not src or not os.path.exists(src):
+            messagebox.showerror("Ошибка", "Сначала выберите исходный файл.")
+            return
+
+        # Запуск в отдельном потоке чтобы не морозить UI
+        def _do():
+            self.btn_md5_src.config(state="disabled", text="⏳ Считается…")
+            self.lbl_status.config(text=f"Расчёт MD5 источника: 0%")
+            try:
+                md5 = compute_md5(
+                    src,
+                    callback=lambda r, t: self.root.after(
+                        0, lambda: self.lbl_status.config(
+                            text=f"Расчёт MD5 источника: {r*100//t}%")
+                    )
+                )
+                self._src_md5 = md5
+                # Создать НОВУЮ запись в истории (не обновлять существующую)
+                dst_dir = self.var_dst.get().strip()
+                if dst_dir:
+                    dst_path = os.path.join(dst_dir, os.path.basename(src))
+                else:
+                    dst_path = os.path.basename(src)
+
+                size_str = fmt_size(os.path.getsize(src))
+
+                self._history_index = self.history_mgr.add({
+                    "src": src,
+                    "dst": dst_path,
+                    "size": size_str,
+                    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "status": "MD5 рассчитан",
+                    "avg_speed_kbps": "—",
+                    "interruptions": 0,
+                    "md5_src": md5,
+                    "md5_dst": "—",
+                })
+                self.root.after(0, self._refresh_history_ui)
+                self.root.after(0, lambda: self.lbl_status.config(
+                    text=f"MD5 источника: {md5}"))
+                self.root.after(0, lambda: self.btn_md5_src.config(
+                    state="normal", text="🔒 MD5 ✓"))
+            except Exception as exc:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Ошибка MD5", f"Не удалось рассчитать MD5:\n{exc}"))
+                self.root.after(0, lambda: self.btn_md5_src.config(
+                    state="normal", text="🔒 MD5"))
+
+        Thread(target=_do, daemon=True).start()
 
     def _choose_dst(self):
         p = filedialog.askdirectory(title="Папка назначения",
@@ -1018,37 +1112,20 @@ class SMBDownloaderApp:
                     f"resume={is_resume})")
         self._update_chunk_sizer()
 
-        # Запись в историю
-        if is_resume:
-            hist_idx = self.history_mgr.find_in_progress(src, dst_path)
-            if hist_idx is not None:
-                self.history_mgr.update(hist_idx, {
-                    "status": STATUS_IN_PROGRESS,
-                    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                })
-                self._history_index = hist_idx
-            else:
-                self._history_index = self.history_mgr.add({
-                    "src": src,
-                    "dst": dst_path,
-                    "size": fmt_size(total),
-                    "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "status": STATUS_IN_PROGRESS,
-                    "avg_speed_kbps": "—",
-                    "interruptions": 0,
-                    "md5_match": "—",
-                })
-        else:
-            self._history_index = self.history_mgr.add({
-                "src": src,
-                "dst": dst_path,
-                "size": fmt_size(total),
-                "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "status": STATUS_IN_PROGRESS,
-                "avg_speed_kbps": "—",
-                "interruptions": 0,
-                "md5_match": "—",
-            })
+        # Запись в историю — всегда НОВАЯ запись
+        md5_src_str = self._src_md5 if self._src_md5 else "—"
+
+        self._history_index = self.history_mgr.add({
+            "src": src,
+            "dst": dst_path,
+            "size": fmt_size(total),
+            "datetime": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "status": STATUS_IN_PROGRESS,
+            "avg_speed_kbps": "—",
+            "interruptions": 0,
+            "md5_src": md5_src_str,
+            "md5_dst": "—",
+        })
         self._refresh_history_ui()
 
         self.copier = FileCopier(
@@ -1085,17 +1162,17 @@ class SMBDownloaderApp:
         logger.info("Pause requested. Thread will save meta and exit.")
 
     def _cancel_copy(self):
-        """Отменить: остановить поток, удалить .part и .meta файлы."""
+        """Отменить: остановить поток, удалить .part и .meta файлы,
+        очистить поля ввода."""
         if not self.copier_thread or not self.copier_thread.is_alive():
             return
-        if not messagebox.askyesno("Отмена", "Отменить копирование?"):
+        if not messagebox.askyesno("Отмена", "Отменить копирование?\nПрогресс будет потерян."):
             return
 
         self.cancel_event.set()
         self.lbl_status.config(text="Отмена…")
         logger.info("Cancel requested.")
 
-        # Подождать завершения потока и удалить временные файлы
         def _cleanup_after_cancel():
             if self.copier_thread and self.copier_thread.is_alive():
                 self.copier_thread.join(timeout=5)
@@ -1110,13 +1187,19 @@ class SMBDownloaderApp:
                             logger.info(f"Removed {p} on cancel.")
                         except OSError:
                             pass
+            # Очистить поля ввода
+            self.var_src.set("")
+            self.var_dst.set(self.config.get("dst_dir", ""))
+            self.btn_md5_src.config(state="disabled", text="🔒 MD5")
+            self._src_md5 = None
+            self.progress_bar["value"] = 0
             self._set_buttons(running=False)
             if self._history_index is not None:
                 self.history_mgr.update(self._history_index, {
                     "status": STATUS_CANCELLED,
                 })
                 self._refresh_history_ui()
-            self.lbl_status.config(text="Отменено.")
+            self.lbl_status.config(text="Отменено. Выберите файл.")
 
         self.root.after(100, _cleanup_after_cancel)
 
@@ -1213,6 +1296,7 @@ class SMBDownloaderApp:
                 self.history_mgr.update(self._history_index, {
                     "status": STATUS_PAUSED,
                     "avg_speed_kbps": f"{self._current_speed_kbps:.1f} КБ/с",
+                    "md5_src": self._src_md5 if self._src_md5 else "—",
                 })
                 self._refresh_history_ui()
         self.root.after(0, _do)
@@ -1225,7 +1309,8 @@ class SMBDownloaderApp:
             if self._history_index is not None:
                 self.history_mgr.update(self._history_index, {
                     "status": STATUS_ERROR,
-                    "md5_match": msg[:80],
+                    "md5_src": self._src_md5 if self._src_md5 else "—",
+                    "md5_dst": msg[:80],
                 })
                 self._refresh_history_ui()
             messagebox.showerror("Ошибка", msg)
@@ -1240,7 +1325,6 @@ class SMBDownloaderApp:
             ints = self.copier._interruption_count if self.copier else 0
 
             status = STATUS_DONE if md5_match else STATUS_ERROR
-            md5_str = src_md5 if md5_match else f"FAIL {src_md5}/{dst_md5}"
 
             if self._history_index is not None:
                 self.history_mgr.update(self._history_index, {
@@ -1249,7 +1333,8 @@ class SMBDownloaderApp:
                         f"{self.copier._current_speed_kbps:.1f} КБ/с"
                         if self.copier else "—",
                     "interruptions": ints,
-                    "md5_match": md5_str,
+                    "md5_src": src_md5,
+                    "md5_dst": dst_md5,
                 })
             else:
                 self.history_mgr.add({
@@ -1260,7 +1345,8 @@ class SMBDownloaderApp:
                     "status": status,
                     "avg_speed_kbps": "—",
                     "interruptions": ints,
-                    "md5_match": md5_str,
+                    "md5_src": src_md5,
+                    "md5_dst": dst_md5,
                 })
             self._refresh_history_ui()
 
@@ -1301,27 +1387,61 @@ class SMBDownloaderApp:
                 entry.get("status", ""),
                 entry.get("avg_speed_kbps", ""),
                 entry.get("interruptions", ""),
-                entry.get("md5_match", "")[:28],
+                entry.get("md5_src", "")[:28],
+                entry.get("md5_dst", "")[:28],
             ))
 
     def _history_double_click(self, event=None):
-        """Двойной клик по записи истории."""
+        """Двойной клик — открыть папку с файлом."""
+        self._history_menu_open_folder()
+
+    def _history_right_click(self, event=None):
+        """Правый клик — показать контекстное меню."""
+        sel = self.hist_tree.identify_row(event.y)
+        if sel:
+            self.hist_tree.selection_set(sel)
+            self.hist_menu.post(event.x_root, event.y_root)
+
+    def _get_selected_entry(self):
+        """Получить выбранную запись из истории."""
         sel = self.hist_tree.selection()
         if not sel:
-            return
-
+            return None
         idx = self.hist_tree.index(sel[0])
         if idx >= len(self.history_mgr.entries):
-            return
+            return None
+        return self.history_mgr.entries[idx]
 
-        entry = self.history_mgr.entries[idx]
-        status = entry.get("status", "")
+    def _history_menu_open_folder(self):
+        """Открыть папку с файлом."""
+        entry = self._get_selected_entry()
+        if not entry:
+            return
+        dst = entry.get("dst", "")
+        dst_dir = os.path.dirname(dst)
+        dst_file = os.path.basename(dst)
+
+        # Если файл существует — открыть папку и выделить его
+        full_path = dst
+        if os.path.exists(full_path):
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(full_path)}"')
+        elif os.path.isdir(dst_dir):
+            os.startfile(dst_dir)
+        else:
+            messagebox.showwarning("Папка не найдена", f"Папка не существует:\n{dst_dir}")
+
+    def _history_menu_retry(self):
+        """Повторить копирование из выбранной записи."""
+        entry = self._get_selected_entry()
+        if not entry:
+            return
 
         src = entry.get("src", "")
         dst = entry.get("dst", "")
         dst_dir = os.path.dirname(dst)
+        status = entry.get("status", "")
 
-        # Если «в процессе» или «пауза» — предложить докачку
+        # Для записей «в процессе»/«пауза» — предложить докачку
         if status in (STATUS_IN_PROGRESS, STATUS_PAUSED):
             part_path = dst + PART_EXTENSION
             meta_path = dst + META_EXTENSION
@@ -1332,7 +1452,6 @@ class SMBDownloaderApp:
                            os.path.exists(pmeta_path))
 
             if has_partial:
-                # Заполнить поля и запустить
                 copied = 0
                 total = entry.get("size", "0")
                 for mp in (meta_path, pmeta_path):
@@ -1351,9 +1470,7 @@ class SMBDownloaderApp:
                     self.var_src.set(src)
                     self.var_dst.set(dst_dir)
                     self._start_copy()
-                return
             else:
-                # Файлы .part удалены — начать заново
                 if messagebox.askyesno(
                         "Нет .part файла",
                         f"Временный файл не найден.\n"
@@ -1362,20 +1479,19 @@ class SMBDownloaderApp:
                     self.var_src.set(src)
                     self.var_dst.set(dst_dir)
                     self._start_copy()
-                return
+            return
 
         # Для завершённых записей — повторить копирование
-        if status in (STATUS_DONE, STATUS_ERROR, STATUS_CANCELLED):
-            if not os.path.exists(src):
-                messagebox.showwarning("Повтор", f"Источник не найден:\n{src}")
-                return
-            if messagebox.askyesno(
-                    "Повторить",
-                    f"Скопировать заново?\n{os.path.basename(src)}"
-            ):
-                self.var_src.set(src)
-                self.var_dst.set(dst_dir)
-                self._start_copy()
+        if not os.path.exists(src):
+            messagebox.showwarning("Повтор", f"Источник не найден:\n{src}")
+            return
+        if messagebox.askyesno(
+                "Повторить",
+                f"Скопировать заново?\n{os.path.basename(src)}"
+        ):
+            self.var_src.set(src)
+            self.var_dst.set(dst_dir)
+            self._start_copy()
 
     def _history_export_csv(self):
         p = filedialog.asksaveasfilename(
@@ -1433,19 +1549,63 @@ class SMBDownloaderApp:
     # ======================== Автоопределение незавершённых ========================
 
     def _check_and_offer_resume(self):
-        """При запуске найти .part файлы и предложить продолжить."""
+        """При запуске найти .part файлы и синхронизировать с историей."""
         partials = detect_partials(self.config.get("dst_dir"))
         if not partials:
             return
 
+        resumed_any = False
+        for p in partials:
+            src = p["src"]
+            dst = p["dst"]
+            copied = p["copied_bytes"]
+            total = p["total_size"]
+
+            # Найти существующую запись в истории
+            hist_idx = self.history_mgr.find_in_progress(src, dst)
+
+            if hist_idx is not None:
+                # Обновить прогресс в существующей записи
+                self.history_mgr.update(hist_idx, {
+                    "status": STATUS_PAUSED,
+                    "size": fmt_size(total),
+                    "avg_speed_kbps": "—",
+                    "md5_src": "—",
+                    "md5_dst": "—",
+                })
+                resumed_any = True
+                logger.info(f"Synced history entry for {os.path.basename(dst)}")
+            else:
+                # Создать новую запись в истории
+                self.history_mgr.add({
+                    "src": src,
+                    "dst": dst,
+                    "size": fmt_size(total),
+                    "datetime": p.get("timestamp", "")[:16].replace("T", " "),
+                    "status": STATUS_PAUSED,
+                    "avg_speed_kbps": "—",
+                    "interruptions": p.get("interruptions", 0),
+                    "md5_src": "—",
+                    "md5_dst": f"Частично: {fmt_size(copied)}",
+                })
+                resumed_any = True
+                logger.info(f"Created history entry for {os.path.basename(dst)}")
+
+        if resumed_any:
+            self._refresh_history_ui()
+
+        # Показать диалог если есть незавершённые
         lines = []
         for p in partials:
             name = os.path.basename(p["dst"])
-            lines.append(f"  {name}: {fmt_size(p['copied_bytes'])} / "
-                         f"{fmt_size(p['total_size'])}")
+            lines.append(
+                f"  {name}: {fmt_size(p['copied_bytes'])} / "
+                f"{fmt_size(p['total_size'])}"
+            )
 
         msg = ("Найдены незавершённые файлы:\n\n" + "\n".join(lines) +
-               "\n\nПродолжить копирование первого из списка?")
+               "\n\nПродолжить копирование первого из списка?\n"
+               "(Также можно дважды кликнуть по записи в вкладке «История»)")
 
         if messagebox.askyesno("Возобновить", msg):
             p = partials[0]
@@ -1456,7 +1616,7 @@ class SMBDownloaderApp:
     # ======================== Закрытие ========================
 
     def _on_close(self):
-        """При закрытии: остановить копирование, сохранить мету."""
+        """При закрытии: остановить копирование, сохранить мету и историю."""
         self._save_settings()
 
         if self.copier_thread and self.copier_thread.is_alive():
@@ -1469,11 +1629,11 @@ class SMBDownloaderApp:
                 self.cancel_event.set()
                 self.copier_thread.join(timeout=3)
 
-            # Обновить историю
-            if self._history_index is not None:
-                self.history_mgr.update(self._history_index, {
-                    "status": STATUS_PAUSED,
-                })
+        # Обновить историю независимо от того, был ли поток
+        if self._history_index is not None:
+            self.history_mgr.update(self._history_index, {
+                "status": STATUS_PAUSED,
+            })
 
         logger.info("Application closed.")
         self.root.destroy()
@@ -1504,7 +1664,7 @@ class SMBDownloaderApp:
 # ===================================================================
 
 def main():
-    logger.info("Application started (v3).")
+    logger.info("Application started (v3.1).")
     root = tk.Tk()
     st = ttk.Style()
     try:
